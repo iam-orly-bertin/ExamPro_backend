@@ -28,6 +28,10 @@ const {
     creerAdminAuto
 } = require("./services/creer_admin_auto");
 
+const {
+    migrerTentatives
+} = require("./services/migration_tentatives");
+
 const application = express();
 
 // Render place l'application derriere un proxy : necessaire pour lire la vraie adresse IP
@@ -72,16 +76,41 @@ application.use("/api/examens", routeExamens);
 
 // Signaler les routes inexistantes
 application.use((req, res) => {
+    console.warn(`404 : ${req.method} ${req.originalUrl}`);
+
     res.status(404).json({
-        message: "Route introuvable."
+        message: `Route introuvable : ${req.method} ${req.originalUrl}`
     });
 });
 
 // Demarrer le serveur
 const port = process.env.PORT || 3000;
 
-application.listen(port, () => {
+application.listen(port, (erreur) => {
+    // Express 5 envoie ici les erreurs de demarrage (ex. port deja utilise)
+    if (erreur) {
+        if (erreur.code === "EADDRINUSE") {
+            console.error(
+                `ERREUR : le port ${port} est deja utilise par un autre programme ` +
+                `(probablement une ancienne instance du serveur). ` +
+                `Fermez-la, puis relancez npm start.`
+            );
+        } else {
+            console.error("ERREUR au demarrage du serveur :", erreur.message);
+        }
+        process.exit(1);
+    }
+
     console.log(`Serveur ExamPro demarre sur le port ${port}`);
+    console.log(`Dossier du serveur : ${__dirname}`);
+    console.log("Version : groupe A (planning, copie, tentatives)");
+
+    // Copier les anciennes tentatives vers la nouvelle table
+    try {
+        migrerTentatives();
+    } catch (erreur) {
+        console.error("Erreur de migration des tentatives :", erreur.message);
+    }
 
     // Creer l'administrateur initial si les variables sont definies
     creerAdminAuto();

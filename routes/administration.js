@@ -11,6 +11,66 @@ const {
 // Toutes les routes de ce fichier sont reservees aux administrateurs.
 router.use(verifierUtilisateur, verifierAdmin);
 
+// ----- Lecture et controle du planning d'un examen -----
+
+// Valeur vide = pas de date. Sinon la date est convertie au format ISO (UTC).
+function lireDate(valeur) {
+    if (valeur === undefined || valeur === null || valeur === "") {
+        return { valeur: null };
+    }
+
+    if (typeof valeur !== "string" || Number.isNaN(Date.parse(valeur))) {
+        return { erreur: true };
+    }
+
+    return { valeur: new Date(valeur).toISOString() };
+}
+
+// Renvoie { erreur } ou les valeurs pretes a etre enregistrees
+function lirePlanning(corps) {
+    const statut = corps.statut === undefined ? "publie" : corps.statut;
+
+    if (statut !== "publie" && statut !== "brouillon") {
+        return { erreur: "Le statut doit être « publie » ou « brouillon »." };
+    }
+
+    const ouverture = lireDate(corps.date_ouverture);
+    const fermeture = lireDate(corps.date_fermeture);
+
+    if (ouverture.erreur || fermeture.erreur) {
+        return { erreur: "Une date d'ouverture ou de fermeture est invalide." };
+    }
+
+    if (
+        ouverture.valeur && fermeture.valeur &&
+        Date.parse(fermeture.valeur) <= Date.parse(ouverture.valeur)
+    ) {
+        return { erreur: "La date de fermeture doit être après la date d'ouverture." };
+    }
+
+    const note = corps.note_reussite === undefined
+        ? 50 : Number(corps.note_reussite);
+
+    if (!Number.isInteger(note) || note < 0 || note > 100) {
+        return { erreur: "La note de réussite doit être un entier entre 0 et 100." };
+    }
+
+    const tentatives = corps.nb_tentatives_max === undefined
+        ? 1 : Number(corps.nb_tentatives_max);
+
+    if (!Number.isInteger(tentatives) || tentatives < 1 || tentatives > 20) {
+        return { erreur: "Le nombre de tentatives doit être un entier entre 1 et 20." };
+    }
+
+    return {
+        statut,
+        date_ouverture: ouverture.valeur,
+        date_fermeture: fermeture.valeur,
+        note_reussite: note,
+        nb_tentatives_max: tentatives
+    };
+}
+
 
 /* ==================================================
    1. GESTION DES COURS
@@ -179,6 +239,11 @@ router.get("/examens", (req, res) => {
                 e.titre,
                 e.cours_id,
                 e.duree_minutes,
+                e.statut,
+                e.date_ouverture,
+                e.date_fermeture,
+                e.note_reussite,
+                e.nb_tentatives_max,
                 c.titre AS cours_titre,
                 COUNT(DISTINCT q.id) AS nombre_questions,
                 (
@@ -186,7 +251,7 @@ router.get("/examens", (req, res) => {
                     WHERE r.examen_id = e.id
                 ) AS nombre_resultats,
                 (
-                    SELECT COUNT(*) FROM tentatives_examens t
+                    SELECT COUNT(*) FROM tentatives t
                     WHERE t.examen_id = e.id
                 ) AS nombre_tentatives
             FROM examens e
@@ -197,6 +262,11 @@ router.get("/examens", (req, res) => {
                 e.titre,
                 e.cours_id,
                 e.duree_minutes,
+                e.statut,
+                e.date_ouverture,
+                e.date_fermeture,
+                e.note_reussite,
+                e.nb_tentatives_max,
                 c.titre
             ORDER BY e.id DESC
         `).all();
@@ -222,6 +292,14 @@ router.post("/examens", (req, res) => {
 
     const idCours = Number(cours_id);
     const duree = Number(duree_minutes);
+
+    const planning = lirePlanning(req.body);
+
+    if (planning.erreur) {
+        return res.status(400).json({
+            message: planning.erreur
+        });
+    }
 
     if (!Number.isInteger(idCours) || idCours <= 0) {
         return res.status(400).json({
@@ -306,9 +384,21 @@ router.post("/examens", (req, res) => {
         // questions sont enregistres ensemble ou pas du tout.
         const creerExamen = base.transaction(() => {
             const resultatExamen = base.prepare(`
-                INSERT INTO examens (cours_id, titre, duree_minutes)
-                VALUES (?, ?, ?)
-            `).run(idCours, titre.trim(), duree);
+                INSERT INTO examens
+                (cours_id, titre, duree_minutes, statut,
+                 date_ouverture, date_fermeture,
+                 note_reussite, nb_tentatives_max)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                idCours,
+                titre.trim(),
+                duree,
+                planning.statut,
+                planning.date_ouverture,
+                planning.date_fermeture,
+                planning.note_reussite,
+                planning.nb_tentatives_max
+            );
 
             const examenId = Number(resultatExamen.lastInsertRowid);
 
@@ -372,10 +462,13 @@ router.get("/resultats", (req, res) => {
                 r.*,
                 u.nom AS etudiant_nom,
                 u.email AS etudiant_email,
-                e.titre AS examen_titre
+                e.titre AS examen_titre,
+                e.note_reussite,
+                t.numero AS tentative_numero
             FROM resultats r
             LEFT JOIN utilisateurs u ON u.id = r.utilisateur_id
             LEFT JOIN examens e ON e.id = r.examen_id
+            LEFT JOIN tentatives t ON t.id = r.tentative_id
             ORDER BY r.id DESC
         `).all();
 
@@ -406,7 +499,9 @@ router.get("/examens/:id", (req, res) => {
 
     try {
         const examen = base.prepare(`
-            SELECT id, cours_id, titre, duree_minutes
+            SELECT id, cours_id, titre, duree_minutes, statut,
+                   date_ouverture, date_fermeture,
+                   note_reussite, nb_tentatives_max
             FROM examens
             WHERE id = ?
         `).get(id);
@@ -458,6 +553,14 @@ router.put("/examens/:id", (req, res) => {
 
     const idCours = Number(cours_id);
     const duree = Number(duree_minutes);
+
+    const planning = lirePlanning(req.body);
+
+    if (planning.erreur) {
+        return res.status(400).json({
+            message: planning.erreur
+        });
+    }
 
     if (!Number.isInteger(id) || id <= 0) {
         return res.status(400).json({
@@ -566,7 +669,7 @@ router.put("/examens/:id", (req, res) => {
 
         // Un étudiant a commencé l'examen (même sans résultat enregistré)
         const tentativeExistante = base.prepare(
-            "SELECT id FROM tentatives_examens WHERE examen_id = ? LIMIT 1"
+            "SELECT id FROM tentatives WHERE examen_id = ? LIMIT 1"
         ).get(id);
 
         if (tentativeExistante) {
@@ -578,9 +681,21 @@ router.put("/examens/:id", (req, res) => {
         const modifierExamen = base.transaction(() => {
             base.prepare(`
                 UPDATE examens
-                SET cours_id = ?, titre = ?, duree_minutes = ?
+                SET cours_id = ?, titre = ?, duree_minutes = ?,
+                    statut = ?, date_ouverture = ?, date_fermeture = ?,
+                    note_reussite = ?, nb_tentatives_max = ?
                 WHERE id = ?
-            `).run(idCours, titre.trim(), duree, id);
+            `).run(
+                idCours,
+                titre.trim(),
+                duree,
+                planning.statut,
+                planning.date_ouverture,
+                planning.date_fermeture,
+                planning.note_reussite,
+                planning.nb_tentatives_max,
+                id
+            );
 
             // Supprimer les anciens choix et les anciennes questions.
             base.prepare(`
@@ -670,7 +785,7 @@ router.delete("/examens/:id", (req, res) => {
         }
 
         const tentativeExistante = base.prepare(
-            "SELECT id FROM tentatives_examens WHERE examen_id = ? LIMIT 1"
+            "SELECT id FROM tentatives WHERE examen_id = ? LIMIT 1"
         ).get(id);
 
         if (tentativeExistante) {
@@ -785,6 +900,260 @@ router.get("/utilisateurs", (req, res) => {
         console.error(erreur);
         res.status(500).json({
             message: "Impossible de récupérer les utilisateurs."
+        });
+    }
+});
+
+
+/* ==================================================
+   6. PLANNING D'UN EXAMEN (modifiable meme si l'examen est verrouille)
+   ================================================== */
+
+router.patch("/examens/:id/planning", (req, res) => {
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({
+            message: "Identifiant de l'examen invalide."
+        });
+    }
+
+    const planning = lirePlanning(req.body);
+
+    if (planning.erreur) {
+        return res.status(400).json({
+            message: planning.erreur
+        });
+    }
+
+    try {
+        const resultat = base.prepare(`
+            UPDATE examens
+            SET statut = ?, date_ouverture = ?, date_fermeture = ?,
+                note_reussite = ?, nb_tentatives_max = ?
+            WHERE id = ?
+        `).run(
+            planning.statut,
+            planning.date_ouverture,
+            planning.date_fermeture,
+            planning.note_reussite,
+            planning.nb_tentatives_max,
+            id
+        );
+
+        if (resultat.changes === 0) {
+            return res.status(404).json({
+                message: "Examen introuvable."
+            });
+        }
+
+        res.json({
+            message: "Planning enregistré."
+        });
+    } catch (erreur) {
+        console.error(erreur);
+        res.status(500).json({
+            message: "Erreur lors de l'enregistrement du planning."
+        });
+    }
+});
+
+
+/* ==================================================
+   7. COPIE D'UN ETUDIANT (reponses question par question)
+   ================================================== */
+
+router.get("/resultats/:id/copie", (req, res) => {
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({
+            message: "Identifiant du résultat invalide."
+        });
+    }
+
+    try {
+        const resultat = base.prepare(`
+            SELECT
+                r.id,
+                r.score,
+                r.total_questions,
+                r.date_passage,
+                r.tentative_id,
+                r.examen_id,
+                u.nom AS etudiant_nom,
+                u.email AS etudiant_email,
+                e.titre AS examen_titre,
+                e.note_reussite,
+                t.numero AS tentative_numero
+            FROM resultats r
+            LEFT JOIN utilisateurs u ON u.id = r.utilisateur_id
+            LEFT JOIN examens e ON e.id = r.examen_id
+            LEFT JOIN tentatives t ON t.id = r.tentative_id
+            WHERE r.id = ?
+        `).get(id);
+
+        if (!resultat) {
+            return res.status(404).json({
+                message: "Résultat introuvable."
+            });
+        }
+
+        const reponses = resultat.tentative_id
+            ? base.prepare(`
+                SELECT question_id, choix_id
+                FROM reponses_etudiants
+                WHERE tentative_id = ?
+            `).all(resultat.tentative_id)
+            : [];
+
+        const choisis = new Set(reponses.map(reponse => reponse.choix_id));
+
+        const questions = base.prepare(`
+            SELECT id, texte
+            FROM questions
+            WHERE examen_id = ?
+            ORDER BY id
+        `).all(resultat.examen_id);
+
+        const lireChoix = base.prepare(`
+            SELECT id, texte, est_correcte
+            FROM choix_reponses
+            WHERE question_id = ?
+            ORDER BY id
+        `);
+
+        const detail = questions.map(question => {
+            const choix = lireChoix.all(question.id).map(element => ({
+                id: element.id,
+                texte: element.texte,
+                est_correcte: Boolean(element.est_correcte),
+                choisi: choisis.has(element.id)
+            }));
+
+            const repondu = choix.some(element => element.choisi);
+
+            return {
+                id: question.id,
+                texte: question.texte,
+                choix,
+                repondu,
+                correcte: repondu && choix.every(
+                    element => element.est_correcte === element.choisi
+                )
+            };
+        });
+
+        const { tentative_id, examen_id, ...infos } = resultat;
+
+        res.json({
+            ...infos,
+            copie_enregistree: reponses.length > 0,
+            questions: detail
+        });
+    } catch (erreur) {
+        console.error(erreur);
+        res.status(500).json({
+            message: "Erreur lors du chargement de la copie."
+        });
+    }
+});
+
+
+/* ==================================================
+   8. AUTORISER UNE NOUVELLE TENTATIVE A UN ETUDIANT
+   ================================================== */
+
+router.post("/examens/:id/autoriser-tentative", (req, res) => {
+    const examenId = Number(req.params.id);
+    const utilisateurId = Number(req.body.utilisateur_id);
+
+    if (
+        !Number.isInteger(examenId) || examenId <= 0 ||
+        !Number.isInteger(utilisateurId) || utilisateurId <= 0
+    ) {
+        return res.status(400).json({
+            message: "Examen ou étudiant invalide."
+        });
+    }
+
+    try {
+        const examen = base.prepare(`
+            SELECT id, nb_tentatives_max, date_ouverture, date_fermeture
+            FROM examens WHERE id = ?
+        `).get(examenId);
+
+        if (!examen) {
+            return res.status(404).json({
+                message: "Examen introuvable."
+            });
+        }
+
+        const etudiant = base.prepare(`
+            SELECT id FROM utilisateurs
+            WHERE id = ? AND role = 'etudiant'
+        `).get(utilisateurId);
+
+        if (!etudiant) {
+            return res.status(404).json({
+                message: "Étudiant introuvable."
+            });
+        }
+
+        const enCours = base.prepare(`
+            SELECT id FROM tentatives
+            WHERE utilisateur_id = ? AND examen_id = ?
+              AND statut = 'en_cours'
+            LIMIT 1
+        `).get(utilisateurId, examenId);
+
+        if (enCours) {
+            return res.status(409).json({
+                message: "Cet étudiant a une tentative en cours."
+            });
+        }
+
+        const utilisees = base.prepare(`
+            SELECT COUNT(*) AS total FROM tentatives
+            WHERE utilisateur_id = ? AND examen_id = ?
+        `).get(utilisateurId, examenId).total;
+
+        const supplementaires = base.prepare(`
+            SELECT COALESCE(SUM(supplementaires), 0) AS total
+            FROM autorisations_tentatives
+            WHERE utilisateur_id = ? AND examen_id = ?
+        `).get(utilisateurId, examenId).total;
+
+        const restantes =
+            examen.nb_tentatives_max + supplementaires - utilisees;
+
+        if (restantes > 0) {
+            return res.status(409).json({
+                message: `Cet étudiant peut encore passer l'examen (${restantes} tentative(s) restante(s)).`
+            });
+        }
+
+        base.prepare(`
+            INSERT INTO autorisations_tentatives
+            (utilisateur_id, examen_id, supplementaires)
+            VALUES (?, ?, 1)
+            ON CONFLICT(utilisateur_id, examen_id)
+            DO UPDATE SET supplementaires = supplementaires + 1
+        `).run(utilisateurId, examenId);
+
+        const fermeture = examen.date_fermeture
+            ? Date.parse(examen.date_fermeture) : NaN;
+
+        res.status(201).json({
+            message: "Nouvelle tentative autorisée.",
+            avertissement: !Number.isNaN(fermeture) && Date.now() > fermeture
+                ? "L'examen est fermé : repoussez sa date de fermeture pour que l'étudiant puisse le passer."
+                : null
+        });
+    } catch (erreur) {
+        console.error(erreur);
+        res.status(500).json({
+            message: "Erreur lors de l'autorisation."
         });
     }
 });

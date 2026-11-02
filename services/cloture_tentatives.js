@@ -5,43 +5,45 @@ const TOLERANCE_MS = 30 * 1000;
 
 // Terminer une tentative restee ouverte.
 // Si aucune reponse n'a ete soumise, la note est 0.
-const cloturerTentative = base.transaction((utilisateurId, examenId) => {
+const cloturerTentative = base.transaction((tentativeId) => {
     const tentative = base.prepare(`
-        SELECT statut
-        FROM tentatives_examens
-        WHERE utilisateur_id = ? AND examen_id = ?
-    `).get(utilisateurId, examenId);
+        SELECT id, utilisateur_id, examen_id, statut
+        FROM tentatives
+        WHERE id = ?
+    `).get(tentativeId);
 
     if (!tentative || tentative.statut !== "en_cours") {
         return false;
     }
 
     const resultatExistant = base.prepare(`
-        SELECT id
-        FROM resultats
-        WHERE utilisateur_id = ? AND examen_id = ?
-        LIMIT 1
-    `).get(utilisateurId, examenId);
+        SELECT id FROM resultats WHERE tentative_id = ?
+    `).get(tentativeId);
 
     if (!resultatExistant) {
         const total = base.prepare(`
-            SELECT COUNT(*) AS total
-            FROM questions
-            WHERE examen_id = ?
-        `).get(examenId).total;
+            SELECT COUNT(*) AS total FROM questions WHERE examen_id = ?
+        `).get(tentative.examen_id).total;
 
         base.prepare(`
             INSERT INTO resultats
-            (utilisateur_id, examen_id, score, total_questions)
-            VALUES (?, ?, 0, ?)
-        `).run(utilisateurId, examenId, total);
+            (utilisateur_id, examen_id, score, total_questions,
+             tentative_id, total_points)
+            VALUES (?, ?, 0, ?, ?, ?)
+        `).run(
+            tentative.utilisateur_id,
+            tentative.examen_id,
+            total,
+            tentativeId,
+            total
+        );
     }
 
     base.prepare(`
-        UPDATE tentatives_examens
-        SET statut = 'termine'
-        WHERE utilisateur_id = ? AND examen_id = ?
-    `).run(utilisateurId, examenId);
+        UPDATE tentatives
+        SET statut = 'termine', date_fin = ?
+        WHERE id = ?
+    `).run(new Date().toISOString(), tentativeId);
 
     return true;
 });
@@ -49,12 +51,8 @@ const cloturerTentative = base.transaction((utilisateurId, examenId) => {
 // Cloturer toutes les tentatives dont le temps (plus la marge) est depasse
 function cloturerTentativesExpirees() {
     const tentatives = base.prepare(`
-        SELECT
-            t.utilisateur_id,
-            t.examen_id,
-            t.date_debut,
-            e.duree_minutes
-        FROM tentatives_examens t
+        SELECT t.id, t.date_debut, e.duree_minutes
+        FROM tentatives t
         JOIN examens e ON e.id = t.examen_id
         WHERE t.statut = 'en_cours'
     `).all();
@@ -76,10 +74,7 @@ function cloturerTentativesExpirees() {
 
         if (maintenant > limite) {
             try {
-                if (cloturerTentative(
-                    tentative.utilisateur_id,
-                    tentative.examen_id
-                )) {
+                if (cloturerTentative(tentative.id)) {
                     total++;
                 }
             } catch (erreur) {
