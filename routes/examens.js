@@ -9,6 +9,13 @@ const {
     cloturerTentative
 } = require("../services/cloture_tentatives");
 
+const {
+    lireQuestionsCompletes,
+    corriger,
+    totaux,
+    avecTotalPoints
+} = require("../services/correction");
+
 const route = express.Router();
 
 route.use(verifierUtilisateur);
@@ -115,6 +122,39 @@ function tempsEcoule(tentative, examen, marge = 0) {
     );
 }
 
+// La correction (bonnes reponses + explications) n'est visible que lorsque
+// l'etudiant a utilise toutes ses tentatives et n'en a aucune en cours.
+function correctionAutorisee(utilisateurId, examenId) {
+    const examen = base.prepare(`
+        SELECT id, nb_tentatives_max FROM examens WHERE id = ?
+    `).get(examenId);
+
+    if (!examen) {
+        return false;
+    }
+
+    const utilisees = base.prepare(`
+        SELECT COUNT(*) AS total FROM tentatives
+        WHERE utilisateur_id = ? AND examen_id = ?
+    `).get(utilisateurId, examenId).total;
+
+    const supplementaires = base.prepare(`
+        SELECT COALESCE(SUM(supplementaires), 0) AS total
+        FROM autorisations_tentatives
+        WHERE utilisateur_id = ? AND examen_id = ?
+    `).get(utilisateurId, examenId).total;
+
+    // CORRECTION_TOUJOURS=true dans le .env : la correction est visible
+    // des la fin de chaque tentative (utile pour une demonstration).
+    const toujours =
+        (process.env.CORRECTION_TOUJOURS || "").trim().toLowerCase() === "true";
+
+    return (
+        !lireTentativeEnCours(utilisateurId, examenId) &&
+        (toujours || utilisees >= examen.nb_tentatives_max + supplementaires)
+    );
+}
+
 function lireIdentifiant(req) {
     const id = Number(req.params.id);
     return Number.isInteger(id) && id >= 1 ? id : null;
@@ -158,7 +198,8 @@ route.get("/", (req, res) => {
                     ORDER BY r.id DESC LIMIT 1
                 ) AS score_precedent,
                 (
-                    SELECT r.total_questions FROM resultats r
+                    SELECT COALESCE(r.total_points, r.total_questions)
+                    FROM resultats r
                     WHERE r.examen_id = e.id AND r.utilisateur_id = ?
                     ORDER BY r.id DESC LIMIT 1
                 ) AS total_precedent
@@ -339,7 +380,7 @@ route.post("/:id/demarrer", (req, res) => {
         }
 
         const questions = base.prepare(`
-            SELECT id, texte FROM questions
+            SELECT id, texte, type, points FROM questions
             WHERE examen_id = ? ORDER BY id
         `).all(examenId);
 
@@ -360,6 +401,8 @@ route.post("/:id/demarrer", (req, res) => {
             questions: questions.map(question => ({
                 id: question.id,
                 texte: question.texte,
+                type: question.type,
+                points: question.points,
                 choix: lireChoix.all(question.id)
             }))
         });
@@ -420,9 +463,7 @@ route.post("/:id/soumettre", (req, res) => {
             });
         }
 
-        const questions = base.prepare(`
-            SELECT id FROM questions WHERE examen_id = ?
-        `).all(examenId);
+        const questions = lireQuestionsCompletes(examenId);
 
         if (questions.length === 0) {
             return res.status(400).json({
@@ -430,59 +471,81 @@ route.post("/:id/soumettre", (req, res) => {
             });
         }
 
-        // Les reponses non donnees comptent comme incorrectes.
-        const identifiants = reponses.map(
-            reponse => reponse && reponse.question_id
+        const questionsParId = new Map(
+            questions.map(question => [question.id, question])
         );
 
-        if (
-            reponses.some(reponse =>
-                !reponse ||
-                !Number.isInteger(reponse.question_id) ||
-                !Number.isInteger(reponse.choix_id)
-            ) ||
-            new Set(identifiants).size !== reponses.length
-        ) {
-            return res.status(400).json({
-                message: "Les réponses sont invalides ou répétées."
-            });
-        }
-
-        const questionsAutorisees = new Set(
-            questions.map(question => question.id)
-        );
-
-        if (reponses.some(reponse =>
-            !questionsAutorisees.has(reponse.question_id)
-        )) {
-            return res.status(400).json({
-                message: "Une question ne correspond pas à cet examen."
-            });
-        }
-
-        const verifierChoix = base.prepare(`
-            SELECT est_correcte FROM choix_reponses
-            WHERE id = ? AND question_id = ?
-        `);
-
-        let score = 0;
+        // Chaque reponse : { question_id, choix_ids: [...] }
+        // (l'ancien format { question_id, choix_id } reste accepte).
+        // Les questions sans reponse comptent comme incorrectes.
+        const choixParQuestion = new Map();
 
         for (const reponse of reponses) {
-            const choix = verifierChoix.get(
-                reponse.choix_id,
-                reponse.question_id
-            );
+            if (!reponse || !Number.isInteger(reponse.question_id)) {
+                return res.status(400).json({
+                    message: "Les réponses sont invalides ou répétées."
+                });
+            }
 
-            if (!choix) {
+            const question = questionsParId.get(reponse.question_id);
+
+            if (!question) {
+                return res.status(400).json({
+                    message: "Une question ne correspond pas à cet examen."
+                });
+            }
+
+            if (choixParQuestion.has(question.id)) {
+                return res.status(400).json({
+                    message: "Les réponses sont invalides ou répétées."
+                });
+            }
+
+            let identifiants;
+
+            if (Array.isArray(reponse.choix_ids)) {
+                identifiants = reponse.choix_ids;
+            } else if (Number.isInteger(reponse.choix_id)) {
+                identifiants = [reponse.choix_id];
+            } else {
+                return res.status(400).json({
+                    message: "Les réponses sont invalides ou répétées."
+                });
+            }
+
+            if (
+                identifiants.some(id => !Number.isInteger(id)) ||
+                new Set(identifiants).size !== identifiants.length
+            ) {
+                return res.status(400).json({
+                    message: "Les réponses sont invalides ou répétées."
+                });
+            }
+
+            const autorises = new Set(question.choix.map(choix => choix.id));
+
+            if (identifiants.some(id => !autorises.has(id))) {
                 return res.status(400).json({
                     message: "Un choix de réponse est invalide."
                 });
             }
 
-            if (choix.est_correcte === 1) {
-                score++;
+            if (question.type !== "choix_multiple" && identifiants.length > 1) {
+                return res.status(400).json({
+                    message: "Une question n'accepte qu'une seule réponse."
+                });
+            }
+
+            if (identifiants.length > 0) {
+                choixParQuestion.set(question.id, identifiants);
             }
         }
+
+        const choisis = new Set(
+            [...choixParQuestion.values()].flat()
+        );
+        const detail = corriger(questions, choisis);
+        const { score, total_points: totalPoints } = totaux(detail);
 
         // Resultat, copie detaillee et fin de tentative : tout ensemble.
         const enregistrer = base.transaction(() => {
@@ -497,7 +560,7 @@ route.post("/:id/soumettre", (req, res) => {
                 score,
                 questions.length,
                 tentative.id,
-                questions.length
+                totalPoints
             );
 
             const insererReponse = base.prepare(`
@@ -506,12 +569,10 @@ route.post("/:id/soumettre", (req, res) => {
                 VALUES (?, ?, ?)
             `);
 
-            for (const reponse of reponses) {
-                insererReponse.run(
-                    tentative.id,
-                    reponse.question_id,
-                    reponse.choix_id
-                );
+            for (const [questionId, identifiants] of choixParQuestion) {
+                for (const choixId of identifiants) {
+                    insererReponse.run(tentative.id, questionId, choixId);
+                }
             }
 
             base.prepare(`
@@ -524,16 +585,28 @@ route.post("/:id/soumettre", (req, res) => {
         });
 
         const resultatId = Number(enregistrer());
-        const pourcentage = Math.round((score / questions.length) * 100);
+        const pourcentage = totalPoints > 0
+            ? Math.round((score / totalPoints) * 100)
+            : 0;
+
+        // La correction n'est donnee que si l'etudiant ne peut plus
+        // repasser l'examen (sinon il connaitrait les reponses).
+        const correctionVisible = correctionAutorisee(
+            utilisateurId,
+            examenId
+        );
 
         res.status(201).json({
             message: "Examen soumis avec succès.",
             resultat_id: resultatId,
             score,
-            total_questions: questions.length,
+            total_questions: totalPoints,
+            nombre_questions: questions.length,
             pourcentage,
             note_reussite: examen.note_reussite,
-            reussi: pourcentage >= examen.note_reussite
+            reussi: pourcentage >= examen.note_reussite,
+            correction_visible: correctionVisible,
+            correction: correctionVisible ? detail : null
         });
     } catch (erreur) {
         console.error("Erreur lors de la soumission :", erreur);
@@ -556,6 +629,8 @@ route.get("/resultats/mes-resultats", (req, res) => {
                 examens.titre AS examen,
                 resultats.score,
                 resultats.total_questions,
+                resultats.total_points,
+                resultats.examen_id,
                 resultats.date_passage,
                 tentatives.numero AS tentative
             FROM resultats
@@ -565,11 +640,74 @@ route.get("/resultats/mes-resultats", (req, res) => {
             ORDER BY resultats.date_passage DESC, resultats.id DESC
         `).all(req.utilisateur.id);
 
-        res.json(resultats);
+        res.json(resultats.map(avecTotalPoints));
     } catch (erreur) {
         console.error(erreur);
         res.status(500).json({
             message: "Erreur lors du chargement des résultats."
+        });
+    }
+});
+
+/* ==================================================
+   CORRECTION D'UN DE SES RESULTATS (bonnes reponses et explications)
+   ================================================== */
+
+route.get("/resultats/:id/correction", (req, res) => {
+    try {
+        const id = lireIdentifiant(req);
+
+        if (id === null) {
+            return res.status(400).json({
+                message: "Identifiant invalide."
+            });
+        }
+
+        const resultat = base.prepare(`
+            SELECT
+                r.id, r.score, r.total_questions, r.total_points,
+                r.date_passage, r.tentative_id, r.examen_id,
+                e.titre AS examen, e.note_reussite
+            FROM resultats r
+            JOIN examens e ON e.id = r.examen_id
+            WHERE r.id = ? AND r.utilisateur_id = ?
+        `).get(id, req.utilisateur.id);
+
+        if (!resultat) {
+            return res.status(404).json({
+                message: "Résultat introuvable."
+            });
+        }
+
+        if (!correctionAutorisee(req.utilisateur.id, resultat.examen_id)) {
+            return res.status(403).json({
+                message: "La correction sera disponible quand vous aurez utilisé toutes vos tentatives."
+            });
+        }
+
+        const reponses = resultat.tentative_id
+            ? base.prepare(`
+                SELECT choix_id FROM reponses_etudiants
+                WHERE tentative_id = ?
+            `).all(resultat.tentative_id)
+            : [];
+
+        const detail = corriger(
+            lireQuestionsCompletes(resultat.examen_id),
+            new Set(reponses.map(reponse => reponse.choix_id))
+        );
+
+        const { tentative_id, examen_id, ...infos } = resultat;
+
+        res.json({
+            ...avecTotalPoints(infos),
+            copie_enregistree: reponses.length > 0,
+            questions: detail
+        });
+    } catch (erreur) {
+        console.error(erreur);
+        res.status(500).json({
+            message: "Erreur lors du chargement de la correction."
         });
     }
 });

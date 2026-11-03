@@ -4,6 +4,13 @@ const router = express.Router();
 const base = require("../database/connexion");
 
 const {
+    validerQuestions,
+    lireQuestionsCompletes,
+    corriger,
+    avecTotalPoints
+} = require("../services/correction");
+
+const {
     verifierUtilisateur,
     verifierAdmin
 } = require("../middleware/verifier_utilisateur");
@@ -319,55 +326,15 @@ router.post("/examens", (req, res) => {
         });
     }
 
-    if (!Array.isArray(questions) || questions.length === 0) {
+    const verification = validerQuestions(questions);
+
+    if (verification.erreur) {
         return res.status(400).json({
-            message: "Ajoutez au moins une question."
+            message: verification.erreur
         });
     }
 
-    // Verifier les questions et leurs choix avant l'insertion.
-    for (let i = 0; i < questions.length; i++) {
-        const question = questions[i];
-
-        if (
-            !question ||
-            typeof question.texte !== "string" ||
-            !question.texte.trim()
-        ) {
-            return res.status(400).json({
-                message: `Le texte de la question ${i + 1} est obligatoire.`
-            });
-        }
-
-        if (!Array.isArray(question.choix) || question.choix.length < 2) {
-            return res.status(400).json({
-                message: `La question ${i + 1} doit avoir au moins deux choix.`
-            });
-        }
-
-        for (const choix of question.choix) {
-            if (
-                !choix ||
-                typeof choix.texte !== "string" ||
-                !choix.texte.trim() ||
-                typeof choix.est_correcte !== "boolean"
-            ) {
-                return res.status(400).json({
-                    message: `Les choix de la question ${i + 1} sont invalides.`
-                });
-            }
-        }
-
-        const nombreCorrectes = question.choix.filter(
-            choix => choix.est_correcte === true
-        ).length;
-
-        if (nombreCorrectes !== 1) {
-            return res.status(400).json({
-                message: `La question ${i + 1} doit avoir exactement une bonne reponse.`
-            });
-        }
-    }
+    const questionsValides = verification.questions;
 
     try {
         const cours = base.prepare(
@@ -403,8 +370,9 @@ router.post("/examens", (req, res) => {
             const examenId = Number(resultatExamen.lastInsertRowid);
 
             const insererQuestion = base.prepare(`
-                INSERT INTO questions (examen_id, texte)
-                VALUES (?, ?)
+                INSERT INTO questions
+                    (examen_id, texte, type, points, explication)
+                VALUES (?, ?, ?, ?, ?)
             `);
 
             const insererChoix = base.prepare(`
@@ -413,10 +381,13 @@ router.post("/examens", (req, res) => {
                 VALUES (?, ?, ?)
             `);
 
-            for (const question of questions) {
+            for (const question of questionsValides) {
                 const resultatQuestion = insererQuestion.run(
                     examenId,
-                    question.texte.trim()
+                    question.texte,
+                    question.type,
+                    question.points,
+                    question.explication
                 );
 
                 const questionId = Number(
@@ -472,7 +443,7 @@ router.get("/resultats", (req, res) => {
             ORDER BY r.id DESC
         `).all();
 
-        res.json(resultats);
+        res.json(resultats.map(avecTotalPoints));
     } catch (erreur) {
         console.error(erreur);
         res.status(500).json({
@@ -513,7 +484,7 @@ router.get("/examens/:id", (req, res) => {
         }
 
         const questions = base.prepare(`
-            SELECT id, texte
+            SELECT id, texte, type, points, explication
             FROM questions
             WHERE examen_id = ?
             ORDER BY id
@@ -529,6 +500,9 @@ router.get("/examens/:id", (req, res) => {
         examen.questions = questions.map(question => ({
             id: question.id,
             texte: question.texte,
+            type: question.type,
+            points: question.points,
+            explication: question.explication,
             choix: obtenirChoix.all(question.id).map(choix => ({
                 id: choix.id,
                 texte: choix.texte,
@@ -586,54 +560,15 @@ router.put("/examens/:id", (req, res) => {
         });
     }
 
-    if (!Array.isArray(questions) || questions.length === 0) {
+    const verification = validerQuestions(questions);
+
+    if (verification.erreur) {
         return res.status(400).json({
-            message: "Ajoutez au moins une question."
+            message: verification.erreur
         });
     }
 
-    for (let i = 0; i < questions.length; i++) {
-        const question = questions[i];
-
-        if (
-            !question ||
-            typeof question.texte !== "string" ||
-            !question.texte.trim()
-        ) {
-            return res.status(400).json({
-                message: `Le texte de la question ${i + 1} est obligatoire.`
-            });
-        }
-
-        if (!Array.isArray(question.choix) || question.choix.length < 2) {
-            return res.status(400).json({
-                message: `La question ${i + 1} doit avoir au moins deux choix.`
-            });
-        }
-
-        for (const choix of question.choix) {
-            if (
-                !choix ||
-                typeof choix.texte !== "string" ||
-                !choix.texte.trim() ||
-                typeof choix.est_correcte !== "boolean"
-            ) {
-                return res.status(400).json({
-                    message: `Les choix de la question ${i + 1} sont invalides.`
-                });
-            }
-        }
-
-        const nombreCorrectes = question.choix.filter(
-            choix => choix.est_correcte
-        ).length;
-
-        if (nombreCorrectes !== 1) {
-            return res.status(400).json({
-                message: `La question ${i + 1} doit avoir exactement une bonne réponse.`
-            });
-        }
-    }
+    const questionsValides = verification.questions;
 
     try {
         const examen = base.prepare(
@@ -710,8 +645,9 @@ router.put("/examens/:id", (req, res) => {
             ).run(id);
 
             const insererQuestion = base.prepare(`
-                INSERT INTO questions (examen_id, texte)
-                VALUES (?, ?)
+                INSERT INTO questions
+                    (examen_id, texte, type, points, explication)
+                VALUES (?, ?, ?, ?, ?)
             `);
 
             const insererChoix = base.prepare(`
@@ -720,10 +656,13 @@ router.put("/examens/:id", (req, res) => {
                 VALUES (?, ?, ?)
             `);
 
-            for (const question of questions) {
+            for (const question of questionsValides) {
                 const resultatQuestion = insererQuestion.run(
                     id,
-                    question.texte.trim()
+                    question.texte,
+                    question.type,
+                    question.points,
+                    question.explication
                 );
 
                 const questionId = Number(resultatQuestion.lastInsertRowid);
@@ -978,6 +917,7 @@ router.get("/resultats/:id/copie", (req, res) => {
                 r.id,
                 r.score,
                 r.total_questions,
+                r.total_points,
                 r.date_passage,
                 r.tentative_id,
                 r.examen_id,
@@ -1009,45 +949,15 @@ router.get("/resultats/:id/copie", (req, res) => {
 
         const choisis = new Set(reponses.map(reponse => reponse.choix_id));
 
-        const questions = base.prepare(`
-            SELECT id, texte
-            FROM questions
-            WHERE examen_id = ?
-            ORDER BY id
-        `).all(resultat.examen_id);
-
-        const lireChoix = base.prepare(`
-            SELECT id, texte, est_correcte
-            FROM choix_reponses
-            WHERE question_id = ?
-            ORDER BY id
-        `);
-
-        const detail = questions.map(question => {
-            const choix = lireChoix.all(question.id).map(element => ({
-                id: element.id,
-                texte: element.texte,
-                est_correcte: Boolean(element.est_correcte),
-                choisi: choisis.has(element.id)
-            }));
-
-            const repondu = choix.some(element => element.choisi);
-
-            return {
-                id: question.id,
-                texte: question.texte,
-                choix,
-                repondu,
-                correcte: repondu && choix.every(
-                    element => element.est_correcte === element.choisi
-                )
-            };
-        });
+        const detail = corriger(
+            lireQuestionsCompletes(resultat.examen_id),
+            choisis
+        );
 
         const { tentative_id, examen_id, ...infos } = resultat;
 
         res.json({
-            ...infos,
+            ...avecTotalPoints(infos),
             copie_enregistree: reponses.length > 0,
             questions: detail
         });

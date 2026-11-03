@@ -1,11 +1,27 @@
-
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
 const base = require("../database/connexion");
+const { verifierUtilisateur } = require("../middleware/verifier_utilisateur");
 
 const route = express.Router();
+
+// Duree de validite du jeton (modifiable avec JETON_DUREE dans le .env : "4h", "8h"...).
+// Le frontend le renouvelle automatiquement toutes les 10 minutes pendant que la page est ouverte.
+const DUREE_JETON = process.env.JETON_DUREE || "4h";
+
+function creerJeton(utilisateur) {
+    return jwt.sign(
+        {
+            id: utilisateur.id,
+            nom: utilisateur.nom,
+            role: utilisateur.role
+        },
+        process.env.JETON_SECRET,
+        { expiresIn: DUREE_JETON }
+    );
+}
 
 // Limiter les tentatives (anti force brute) : 10 essais / 15 minutes par adresse IP
 const limiteur = rateLimit({
@@ -108,16 +124,8 @@ route.post("/connexion", limiteur, async (req, res) => {
             });
         }
 
-        // Creer un jeton valable pendant 2 heures
-        const jeton = jwt.sign(
-            {
-                id: utilisateur.id,
-                nom: utilisateur.nom,
-                role: utilisateur.role
-            },
-            process.env.JETON_SECRET,
-            { expiresIn: "2h" }
-        );
+        // Creer un jeton (duree : voir DUREE_JETON)
+        const jeton = creerJeton(utilisateur);
 
         res.json({
             message: "Connexion reussie.",
@@ -133,6 +141,29 @@ route.post("/connexion", limiteur, async (req, res) => {
         console.error(erreur);
         res.status(500).json({
             message: "Erreur lors de la connexion."
+        });
+    }
+});
+
+// RENOUVELER le jeton (appele automatiquement par le frontend)
+// Verifie aussi que le compte existe toujours et reprend son role actuel.
+route.post("/renouveler", verifierUtilisateur, (req, res) => {
+    try {
+        const utilisateur = base.prepare(
+            "SELECT id, nom, role FROM utilisateurs WHERE id = ?"
+        ).get(req.utilisateur.id);
+
+        if (!utilisateur) {
+            return res.status(401).json({
+                message: "Compte introuvable."
+            });
+        }
+
+        res.json({ jeton: creerJeton(utilisateur) });
+    } catch (erreur) {
+        console.error(erreur);
+        res.status(500).json({
+            message: "Erreur lors du renouvellement de la session."
         });
     }
 });

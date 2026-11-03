@@ -21,9 +21,10 @@ const cloturerTentative = base.transaction((tentativeId) => {
     `).get(tentativeId);
 
     if (!resultatExistant) {
-        const total = base.prepare(`
-            SELECT COUNT(*) AS total FROM questions WHERE examen_id = ?
-        `).get(tentative.examen_id).total;
+        const { total, points } = base.prepare(`
+            SELECT COUNT(*) AS total, COALESCE(SUM(points), 0) AS points
+            FROM questions WHERE examen_id = ?
+        `).get(tentative.examen_id);
 
         base.prepare(`
             INSERT INTO resultats
@@ -35,7 +36,7 @@ const cloturerTentative = base.transaction((tentativeId) => {
             tentative.examen_id,
             total,
             tentativeId,
-            total
+            points
         );
     }
 

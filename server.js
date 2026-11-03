@@ -32,6 +32,10 @@ const {
     migrerTentatives
 } = require("./services/migration_tentatives");
 
+const {
+    creerDonneesDemo
+} = require("./services/donnees_demo");
+
 const application = express();
 
 // Render place l'application derriere un proxy : necessaire pour lire la vraie adresse IP
@@ -114,6 +118,13 @@ application.listen(port, (erreur) => {
 
     // Creer l'administrateur initial si les variables sont definies
     creerAdminAuto();
+
+    // Base vide (ex. apres un redeploiement) : remettre des donnees de demonstration
+    try {
+        creerDonneesDemo();
+    } catch (erreur) {
+        console.error("Erreur des donnees de demonstration :", erreur.message);
+    }
 
     // Cloturer les tentatives dont le temps est depasse
     demarrerCloture();
